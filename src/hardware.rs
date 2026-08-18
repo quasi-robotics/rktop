@@ -1,6 +1,7 @@
 use regex::Regex;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use goblin::Object;
 use crate::file_cache::{read_cached_file, read_cached_u32, read_cached_i32};
 
@@ -180,33 +181,215 @@ pub fn get_hwmon_sensors() -> Vec<(String, String)> {
     sensors
 }
 
-/// Read GPU utilization from Mali debugfs (using cached file descriptors)
-pub fn get_gpu_usage() -> Option<f32> {
-    let path = "/sys/kernel/debug/mali0/dvfs_utilization";
-    if let Ok(content) = read_cached_file(path) {
-        // Parse "busy_time: X idle_time: Y" format
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        let mut busy_time = 0u64;
-        let mut idle_time = 0u64;
+/// True for Rockchip/Mali GPU devfreq / platform device names (not NPU/DMC).
+fn is_gpu_device_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("gpu") || n.contains("mali") || n.contains("panthor") || n.contains("panfrost")
+}
 
-        for i in (0..parts.len()).step_by(2) {
-            if i + 1 < parts.len() {
-                let key = parts[i].trim_end_matches(':');
-                let value = parts[i + 1].parse::<u64>().ok()?;
-                match key {
-                    "busy_time" => busy_time = value,
-                    "idle_time" => idle_time = value,
-                    _ => {}
+/// GPU sysfs/devfreq directories, discovered once at first use.
+fn gpu_devfreq_dirs() -> &'static [String] {
+    static DIRS: OnceLock<Vec<String>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir("/sys/class/devfreq") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_gpu_device_name(&name) {
+                    dirs.push(entry.path().to_string_lossy().into_owned());
                 }
             }
         }
+        dirs
+    })
+}
 
-        let total_time = busy_time + idle_time;
-        if total_time > 0 {
-            return Some((busy_time as f32 / total_time as f32) * 100.0);
+/// Parse Rockchip/Mali devfreq load: `"45@1000000000Hz"`.
+fn parse_devfreq_load(content: &str) -> Option<f32> {
+    let token = content.split_whitespace().next()?;
+    let load_part = token.split('@').next()?.trim();
+    load_part.parse::<f32>().ok().map(normalize_gpu_percent)
+}
+
+/// Parse a 0–100 (or legacy Mali 0–256) utilisation value.
+fn parse_utilisation(content: &str) -> Option<f32> {
+    content.trim().parse::<f32>().ok().map(normalize_gpu_percent)
+}
+
+fn normalize_gpu_percent(value: f32) -> f32 {
+    if value > 100.0 && value <= 256.0 {
+        // Older Mali kbase reported utilisation in the range 0–256.
+        (value / 256.0) * 100.0
+    } else {
+        value.clamp(0.0, 100.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum GpuUsageSource {
+    /// `/sys/class/devfreq/<gpu>/load` → `LOAD@FREQHz` (RK3588 Mali-G610)
+    DevfreqLoad(String),
+    /// Mali kbase `utilisation` over `utilisation_period` (typically 100 ms)
+    Utilisation(String),
+    /// Panfrost/Panthor `gpu_busy_percent`
+    DrmBusy(String),
+    /// Legacy Mali debugfs; must use per-interval deltas, not lifetime totals
+    DvfsUtilization,
+}
+
+fn discover_gpu_usage_source() -> Option<GpuUsageSource> {
+    // 1. Devfreq load — the metric the kernel DVFS governor uses. On Mali-G610
+    //    CSF (Orange Pi 5B / RK3588) this tracks real GPU work; debugfs
+    //    dvfs_utilization does not (lifetime busy/idle, busy often stuck).
+    for dir in gpu_devfreq_dirs() {
+        let load_path = format!("{}/load", dir);
+        if let Ok(content) = fs::read_to_string(&load_path) {
+            if parse_devfreq_load(&content).is_some() {
+                return Some(GpuUsageSource::DevfreqLoad(load_path));
+            }
         }
     }
+
+    // 2. Mali kbase utilisation sysfs (0–100 over the last utilisation_period)
+    const UTIL_PATHS: &[&str] = &[
+        "/sys/devices/platform/fb000000.gpu/utilisation",
+        "/sys/devices/platform/fb000000.gpu-mali/utilisation",
+        "/sys/devices/platform/fb000000.gpu-panthor/utilisation",
+    ];
+    for path in UTIL_PATHS {
+        if let Ok(content) = fs::read_to_string(path) {
+            if parse_utilisation(&content).is_some() {
+                return Some(GpuUsageSource::Utilisation((*path).to_string()));
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir("/sys/devices/platform") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_gpu_device_name(&name) {
+                continue;
+            }
+            let util_path = entry.path().join("utilisation");
+            if let Ok(content) = fs::read_to_string(&util_path) {
+                if parse_utilisation(&content).is_some() {
+                    return Some(GpuUsageSource::Utilisation(util_path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+
+    // 3. Upstream Panfrost/Panthor DRM busy percent
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip connectors such as card0-HDMI-A-1
+            if !name.starts_with("card") || name.contains('-') {
+                continue;
+            }
+            let busy_path = entry.path().join("device/gpu_busy_percent");
+            if let Ok(content) = fs::read_to_string(&busy_path) {
+                if parse_utilisation(&content).is_some() {
+                    return Some(GpuUsageSource::DrmBusy(busy_path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+
+    // 4. Legacy Mali debugfs (RK3399 / older bifrost). Sample deltas, not totals.
+    if Path::new("/sys/kernel/debug/mali0/dvfs_utilization").exists() {
+        return Some(GpuUsageSource::DvfsUtilization);
+    }
+
     None
+}
+
+fn gpu_usage_source() -> Option<&'static GpuUsageSource> {
+    static SOURCE: OnceLock<Option<GpuUsageSource>> = OnceLock::new();
+    SOURCE.get_or_init(discover_gpu_usage_source).as_ref()
+}
+
+fn parse_dvfs_busy_idle(content: &str) -> Option<(u64, u64)> {
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    let mut busy_time = 0u64;
+    let mut idle_time = 0u64;
+    let mut protm_time = 0u64;
+    let mut saw_busy = false;
+    let mut saw_idle = false;
+
+    for i in (0..parts.len()).step_by(2) {
+        if i + 1 >= parts.len() {
+            break;
+        }
+        let key = parts[i].trim_end_matches(':');
+        let value = match parts[i + 1].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match key {
+            "busy_time" => {
+                busy_time = value;
+                saw_busy = true;
+            }
+            "idle_time" => {
+                idle_time = value;
+                saw_idle = true;
+            }
+            "protm_time" => protm_time = value,
+            _ => {}
+        }
+    }
+
+    if saw_busy && saw_idle {
+        Some((busy_time.saturating_add(protm_time), idle_time))
+    } else {
+        None
+    }
+}
+
+/// Interval GPU load from Mali `dvfs_utilization` busy/idle counters.
+/// Lifetime totals are *not* current load on Mali-G610 CSF.
+fn gpu_usage_from_dvfs_delta(content: &str) -> Option<f32> {
+    static PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    let (busy, idle) = parse_dvfs_busy_idle(content)?;
+    let mut prev = PREV.lock().ok()?;
+    let usage = if let Some((prev_busy, prev_idle)) = *prev {
+        let delta_busy = busy.saturating_sub(prev_busy);
+        let delta_idle = idle.saturating_sub(prev_idle);
+        let total = delta_busy.saturating_add(delta_idle);
+        if total > 0 {
+            Some((delta_busy as f32 / total as f32) * 100.0)
+        } else {
+            Some(0.0)
+        }
+    } else {
+        // First sample: report 0 rather than the misleading lifetime average.
+        Some(0.0)
+    };
+    *prev = Some((busy, idle));
+    usage
+}
+
+/// Read current GPU utilisation.
+///
+/// Mali-G610 (CSF) on RK3588 does not update debugfs `dvfs_utilization` in a
+/// way that yields current load: `busy_time` barely moves, so
+/// `busy/(busy+idle)` is a decaying average since boot (~a few percent) even
+/// when the GPU is fully busy. Prefer the kernel's live sysfs metrics.
+pub fn get_gpu_usage() -> Option<f32> {
+    match gpu_usage_source()? {
+        GpuUsageSource::DevfreqLoad(path) => {
+            read_cached_file(path).ok().and_then(|c| parse_devfreq_load(&c))
+        }
+        GpuUsageSource::Utilisation(path) | GpuUsageSource::DrmBusy(path) => {
+            read_cached_file(path).ok().and_then(|c| parse_utilisation(&c))
+        }
+        GpuUsageSource::DvfsUtilization => {
+            read_cached_file("/sys/kernel/debug/mali0/dvfs_utilization")
+                .ok()
+                .and_then(|c| gpu_usage_from_dvfs_delta(&c))
+        }
+    }
 }
 
 /// Read CPU frequencies for each core (using cached file descriptors)
@@ -257,21 +440,26 @@ pub fn get_cpu_freq_ranges() -> Vec<(u32, u32)> {
     ranges
 }
 
-/// Read GPU frequency
+/// Read GPU frequency in MHz
 pub fn get_gpu_frequency() -> Option<u32> {
-    let paths = [
-        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
-        "/sys/class/devfreq/fb000000.gpu/cur_freq",
-    ];
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        let mut candidates: Vec<String> = gpu_devfreq_dirs()
+            .iter()
+            .map(|dir| format!("{}/cur_freq", dir))
+            .collect();
+        candidates.extend([
+            "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq".into(),
+            "/sys/class/devfreq/fb000000.gpu/cur_freq".into(),
+            "/sys/class/devfreq/fb000000.gpu-mali/cur_freq".into(),
+        ]);
+        candidates.into_iter().find(|p| Path::new(p).exists())
+    }).as_ref()?;
 
-    for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(freq_hz) = content.trim().parse::<u64>() {
-                return Some((freq_hz / 1_000_000) as u32); // Convert to MHz
-            }
-        }
-    }
-    None
+    read_cached_file(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u64>().ok())
+        .map(|freq_hz| (freq_hz / 1_000_000) as u32)
 }
 
 /// Read NPU frequency (using cached file descriptors)
@@ -530,4 +718,73 @@ pub fn get_librknnrt_version() -> String {
 /// Read librkllmrt library version
 pub fn get_librkllmrt_version() -> String {
     extract_version_from_binary("/usr/lib/librkllmrt.so", "RKLLM SDK (version:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_devfreq_load_rk3588_format() {
+        assert_eq!(parse_devfreq_load("0@1000000000Hz\n"), Some(0.0));
+        assert_eq!(parse_devfreq_load("99@1000000000Hz"), Some(99.0));
+        assert_eq!(parse_devfreq_load("  45@800000000Hz  "), Some(45.0));
+        assert!(parse_devfreq_load("").is_none());
+        assert!(parse_devfreq_load("not-a-load").is_none());
+    }
+
+    #[test]
+    fn parse_utilisation_percent_and_legacy_256() {
+        assert_eq!(parse_utilisation("0\n"), Some(0.0));
+        assert_eq!(parse_utilisation("99"), Some(99.0));
+        assert_eq!(parse_utilisation("256"), Some(100.0));
+        assert_eq!(parse_utilisation("128"), Some(50.0));
+        assert!(parse_utilisation("").is_none());
+    }
+
+    #[test]
+    fn parse_dvfs_includes_protm_as_busy() {
+        let (busy, idle) = parse_dvfs_busy_idle(
+            "busy_time: 100 idle_time: 900 protm_time: 50\n",
+        )
+        .unwrap();
+        assert_eq!(busy, 150);
+        assert_eq!(idle, 900);
+    }
+
+    #[test]
+    fn gpu_device_name_excludes_npu_and_dmc() {
+        assert!(is_gpu_device_name("fb000000.gpu"));
+        assert!(is_gpu_device_name("fb000000.gpu-mali"));
+        assert!(is_gpu_device_name("fb000000.gpu-panthor"));
+        assert!(!is_gpu_device_name("fdab0000.npu"));
+        assert!(!is_gpu_device_name("dmc"));
+    }
+
+    #[test]
+    fn live_gpu_usage_uses_devfreq_load_on_mali_g610() {
+        let load_path = "/sys/class/devfreq/fb000000.gpu/load";
+        if !Path::new(load_path).exists() {
+            return;
+        }
+
+        match gpu_usage_source() {
+            Some(GpuUsageSource::DevfreqLoad(path)) => {
+                assert!(path.ends_with("/load"), "unexpected path {path}");
+            }
+            other => panic!("expected DevfreqLoad source, got {other:?}"),
+        }
+
+        let usage = get_gpu_usage().expect("GPU usage should be available");
+        assert!(
+            (0.0..=100.0).contains(&usage),
+            "usage {usage}% out of range"
+        );
+
+        // Cached sysfs reads must keep returning parseable load data.
+        let a = read_cached_file(load_path).expect("first cached read");
+        let b = read_cached_file(load_path).expect("second cached read");
+        assert!(parse_devfreq_load(&a).is_some(), "first cached value {a:?}");
+        assert!(parse_devfreq_load(&b).is_some(), "second cached value {b:?}");
+    }
 }
